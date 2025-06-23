@@ -8,14 +8,16 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 # ★★★ バージョン情報 ★★★
-APP_VERSION = "proto.1.4.0" # 平滑化強化版
+APP_VERSION = "proto.1.4.1" # 表示形式変更版
 APP_CREDIT = "Okuno with 🤖 Claude"
 
 # --- ヘルパー関数: サマリー作成 ---
 def _create_summary(schedule_df, staff_info_dict, year, month, event_units):
     num_days = calendar.monthrange(year, month)[1]; days = list(range(1, num_days + 1)); daily_summary = []
     for d in days:
-        day_info = {}; work_staff_ids = schedule_df[schedule_df[d] == '出']['職員番号']
+        day_info = {}; 
+        # 出勤者は空白、○、出のいずれか
+        work_staff_ids = schedule_df[(schedule_df[d] == '') | (schedule_df[d] == '○') | (schedule_df[d] == '出')]['職員番号']
         half_day_staff_ids = [s for s, dates in st.session_state.requests_half.items() if d in dates]
         total_workers = sum(0.5 if sid in half_day_staff_ids else 1 for sid in work_staff_ids)
         day_info['日'] = d; day_info['曜日'] = ['月','火','水','木','金','土','日'][calendar.weekday(year, month, d)]
@@ -40,18 +42,21 @@ def _create_summary(schedule_df, staff_info_dict, year, month, event_units):
     return pd.DataFrame(daily_summary)
 
 # --- 勤務表DataFrame作成ヘルパー ---
-def _create_schedule_df(shifts_values, staff, days, staff_df, requests_x, requests_tri, requests_paid, requests_special):
+def _create_schedule_df(shifts_values, staff, days, staff_df, requests_x, requests_tri, requests_paid, requests_special, requests_must_work=None):
     schedule_data = {}
     for s in staff:
-        row = []; s_requests_x = requests_x.get(s, []); s_requests_tri = requests_tri.get(s, []); s_requests_paid = requests_paid.get(s, []); s_requests_special = requests_special.get(s, [])
+        row = []; s_requests_x = requests_x.get(s, []); s_requests_tri = requests_tri.get(s, []); s_requests_paid = requests_paid.get(s, []); s_requests_special = requests_special.get(s, []); s_requests_must = requests_must_work.get(s, []) if requests_must_work else []
         for d in days:
-            if shifts_values.get((s, d), 0) == 0:
+            if shifts_values.get((s, d), 0) == 0:  # 休みの場合
                 if d in s_requests_x: row.append('×')
                 elif d in s_requests_tri: row.append('△')
                 elif d in s_requests_paid: row.append('有')
                 elif d in s_requests_special: row.append('特')
                 else: row.append('-')
-            else: row.append('出')
+            else:  # 出勤の場合
+                if d in s_requests_must: row.append('○')  # 出勤希望だった場合
+                elif d in s_requests_tri: row.append('出')  # 準希望休だったのに出勤になった場合
+                else: row.append('')  # 通常の出勤は空白
         schedule_data[s] = row
     schedule_df = pd.DataFrame.from_dict(schedule_data, orient='index', columns=days)
     schedule_df = schedule_df.reset_index().rename(columns={'index': '職員番号'})
@@ -263,7 +268,7 @@ def solve_three_patterns(staff_df, requests_df, year, month,
     params['avg_residual_units'] = (sum(int(staff_info[s]['1日の単位数']) for s in staff) * (len(weekdays)) * (len(staff)-9)/len(staff) - sum(event_units.values())) / len(weekdays) if weekdays else 0
     params['target_staff_weekday'] = {job: (num_days - 9) * len(members) / len(weekdays) if weekdays else 0 for job, members in params['job_types'].items() if members}
     params['requests_x'] = requests_x; params['requests_tri'] = requests_tri; params['requests_paid'] = requests_paid; params['requests_special'] = requests_special
-    params['requests_half'] = st.session_state.requests_half
+    params['requests_half'] = st.session_state.requests_half; params['requests_must_work'] = requests_must_work
     
     results = []
     base_solution_values = None
@@ -271,10 +276,10 @@ def solve_three_patterns(staff_df, requests_df, year, month,
         model1, shifts1 = build_model()
         solver1 = cp_model.CpSolver(); solver1.parameters.max_time_in_seconds = 30.0; status1 = solver1.Solve(model1)
     if status1 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return False, [], "致命的エラー: 勤務表を作成できませんでした。ハード制約が矛盾している可能性があります。"
+        return False, [], "致命的エラー: 勤務表を作成できませんでした。ハード制約が矛盾している可能性があります。", None
     base_solution_values = {(s, d): solver1.Value(shifts1[(s, d)]) for s in staff for d in days}
     result1 = {"title": "勤務表パターン1", "status": solver1.StatusName(status1), "penalty": round(solver1.ObjectiveValue())}
-    result1["schedule_df"] = _create_schedule_df(base_solution_values, staff, days, staff_df, requests_x, requests_tri, requests_paid, requests_special)
+    result1["schedule_df"] = _create_schedule_df(base_solution_values, staff, days, staff_df, requests_x, requests_tri, requests_paid, requests_special, requests_must_work)
     params['unit_penalty_weight'] = round(10 * unit_penalty_multiplier)
     params['staff_penalty_weight'] = round(5 * unit_penalty_multiplier)
     result1["breakdown"] = _calculate_penalty_breakdown(base_solution_values, params)
@@ -286,7 +291,7 @@ def solve_three_patterns(staff_df, requests_df, year, month,
     if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         solution2_values = {(s, d): solver2.Value(shifts2[(s, d)]) for s in staff for d in days}
         result2 = {"title": "勤務表パターン2", "status": solver2.StatusName(status2), "penalty": round(solver2.ObjectiveValue())}
-        result2["schedule_df"] = _create_schedule_df(solution2_values, staff, days, staff_df, requests_x, requests_tri, requests_paid, requests_special)
+        result2["schedule_df"] = _create_schedule_df(solution2_values, staff, days, staff_df, requests_x, requests_tri, requests_paid, requests_special, requests_must_work)
         result2["breakdown"] = _calculate_penalty_breakdown(solution2_values, params)
         results.append(result2)
 
@@ -296,13 +301,13 @@ def solve_three_patterns(staff_df, requests_df, year, month,
     if status3 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         solution3_values = {(s, d): solver3.Value(shifts3[(s, d)]) for s in staff for d in days}
         result3 = {"title": "勤務表パターン3 (平準化重視)", "status": solver3.StatusName(status3), "penalty": round(solver3.ObjectiveValue())}
-        result3["schedule_df"] = _create_schedule_df(solution3_values, staff, days, staff_df, requests_x, requests_tri, requests_paid, requests_special)
+        result3["schedule_df"] = _create_schedule_df(solution3_values, staff, days, staff_df, requests_x, requests_tri, requests_paid, requests_special, requests_must_work)
         params['unit_penalty_weight'] = round(20 * unit_penalty_multiplier)
         params['staff_penalty_weight'] = round(15 * unit_penalty_multiplier)
         result3["breakdown"] = _calculate_penalty_breakdown(solution3_values, params)
         results.append(result3)
     
-    return True, results, f"{len(results)}パターンの探索が完了しました。"
+    return True, results, f"{len(results)}パターンの探索が完了しました。", requests_must_work
 
 def display_result(result_data, staff_info, event_units, year, month):
     st.header(result_data['title'])
@@ -311,8 +316,12 @@ def display_result(result_data, staff_info, event_units, year, month):
         breakdown_df = pd.DataFrame(result_data['breakdown'].items(), columns=['ルール', 'ペナルティ点'])
         st.dataframe(breakdown_df, hide_index=True)
     schedule_df = result_data["schedule_df"]
-    temp_work_df = schedule_df.replace({'×': '休', '-': '休', '△': '休', '有': '休', '特': '休', '': '出'})
-    summary_df = _create_summary(temp_work_df, staff_info, year, month, event_units)
+    # 出勤扱いのものを統一して判定用のDataFrameを作成
+    temp_work_df = schedule_df.copy()
+    for col in temp_work_df.columns:
+        if col not in ['職員番号', '職員名', '職種']:
+            temp_work_df[col] = temp_work_df[col].apply(lambda x: '出' if x in ['', '○', '出'] else '休')
+    summary_df = _create_summary(schedule_df, staff_info, year, month, event_units)
     
     # ★ 業務負荷の分析表示を追加
     with st.expander("業務負荷の詳細分析"):
@@ -320,7 +329,8 @@ def display_result(result_data, staff_info, event_units, year, month):
         weekdays = [d for d in range(1, calendar.monthrange(year, month)[1] + 1) if calendar.weekday(year, month, d) != 6]
         
         for d in weekdays:
-            work_staff_ids = temp_work_df[temp_work_df[d] == '出']['職員番号']
+            # 出勤者は空白、○、出のいずれか
+            work_staff_ids = schedule_df[(schedule_df[d] == '') | (schedule_df[d] == '○') | (schedule_df[d] == '出')]['職員番号']
             half_day_staff_ids = [s for s, dates in st.session_state.requests_half.items() if d in dates]
             
             daily_units = sum(
@@ -457,7 +467,7 @@ if create_button:
             if '職員名' not in staff_df.columns:
                 staff_df['職員名'] = staff_df['職種'] + " " + staff_df['職員番号'].astype(str)
                 st.info("職員一覧に「職員名」列がなかったため、仮の職員名を生成しました。")
-            is_feasible, results, message = solve_three_patterns(
+            is_feasible, results, message, requests_must_work = solve_three_patterns(
                 staff_df, requests_df, year, month,
                 target_pt, target_ot, target_st, tolerance,
                 event_units_input, tri_penalty_weight, min_distance,
