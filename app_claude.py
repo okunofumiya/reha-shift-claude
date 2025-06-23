@@ -9,7 +9,7 @@ from dateutil.relativedelta import relativedelta
 
 # ★★★ バージョン情報 ★★★
 APP_VERSION = "proto.1.4.1" # 表示形式変更版
-APP_CREDIT = "Okuno with 🤖 Claude"
+APP_CREDIT = "Okuno with 🤖 Gemini and Claude"
 
 # --- ヘルパー関数: サマリー作成 ---
 def _create_summary(schedule_df, staff_info_dict, year, month, event_units):
